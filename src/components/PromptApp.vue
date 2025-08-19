@@ -1,11 +1,20 @@
 <script setup>
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch, onMounted, nextTick } from 'vue'
+import * as htmlToImage from 'html-to-image'
 
 // Core state
 const rawPrompt = ref('')
 const generatedPrompt = ref('')
 const showCard = computed(() => generatedPrompt.value.length > 0)
-const maxChars = 500
+const maxChars = 1200
+
+// Layout & export
+const layout = ref('square') // 'square' | 'vertical'
+const exporting = ref(false)
+const pages = ref([]) // chunked prompt lines
+const pageHeightPx = 1080 // for vertical reference (not strictly needed)
+
+const layoutLabel = computed(() => layout.value === 'square' ? '小红书 / Instagram 方形' : '抖音 / TikTok 竖屏')
 
 // Gradient palette
 const gradients = [
@@ -38,6 +47,7 @@ function cycleGradient() {
 function generateCard() {
   if (!rawPrompt.value.trim()) return
   generatedPrompt.value = rawPrompt.value.trim()
+  buildPages()
   cycleGradient()
   updateUrlParam(generatedPrompt.value)
   requestAnimationFrame(() => {
@@ -94,6 +104,59 @@ function hashString(str) {
 }
 onMounted(loadFromUrl)
 watch(rawPrompt, v => { if (v.length > maxChars) rawPrompt.value = v.slice(0, maxChars) })
+
+watch(generatedPrompt, () => buildPages())
+
+function buildPages() {
+  // Split by line, approximate characters per page based on layout.
+  const text = generatedPrompt.value
+  if (!text) { pages.value = []; return }
+  const lines = text.split(/\n+/)
+  const maxCharsPerPage = layout.value === 'square' ? 420 : 650
+  const chunked = []
+  let buf = ''
+  for (const line of lines) {
+    const add = (buf ? '\n' : '') + line
+    if ((buf + add).length > maxCharsPerPage) {
+      if (buf) chunked.push(buf)
+      buf = line
+      if (buf.length > maxCharsPerPage) {
+        // hard split long single line
+        while (buf.length > maxCharsPerPage) {
+          chunked.push(buf.slice(0, maxCharsPerPage))
+          buf = buf.slice(maxCharsPerPage)
+        }
+      }
+    } else {
+      buf += add
+    }
+  }
+  if (buf) chunked.push(buf)
+  pages.value = chunked
+}
+
+async function exportImages() {
+  if (!showCard.value) return
+  exporting.value = true
+  await nextTick()
+  try {
+    const nodes = Array.from(document.querySelectorAll('.export-page'))
+    let idx = 1
+    for (const node of nodes) {
+      // scale up for quality
+      const dataUrl = await htmlToImage.toPng(node, { pixelRatio: 2 })
+      const link = document.createElement('a')
+      link.download = `prompt-card-${layout.value}-${idx}.png`
+      link.href = dataUrl
+      link.click()
+      idx++
+    }
+  } catch (e) {
+    console.error('Export failed', e)
+  } finally {
+    exporting.value = false
+  }
+}
 </script>
 
 <template>
@@ -112,21 +175,31 @@ watch(rawPrompt, v => { if (v.length > maxChars) rawPrompt.value = v.slice(0, ma
       <div class="actions">
         <button class="primary" :disabled="!rawPrompt.trim()" @click="generateCard">Generate Card</button>
         <button class="ghost" v-if="showCard" @click="copyUrl">{{ copiedUrl ? 'URL Copied!' : 'Copy Share URL' }}</button>
+        <select v-if="showCard" v-model="layout" class="layout-select" @change="buildPages">
+          <option value="square">方形 (1:1)</option>
+          <option value="vertical">竖屏 (9:16)</option>
+        </select>
+        <button class="ghost" v-if="showCard" :disabled="exporting" @click="exportImages">{{ exporting ? '导出中...' : '导出图片' }}</button>
       </div>
       <p class="hint">Press ⌘⏎ / Ctrl⏎ to generate.</p>
     </section>
     <transition name="fade-slide">
       <section v-if="showCard" class="card-wrapper">
-        <article class="prompt-card" :style="{ background: gradients[gradientIndex] }">
-          <div class="card-inner">
-            <h2 class="card-title">Your Prompt</h2>
-            <p class="prompt-text" v-text="generatedPrompt" />
-            <div class="share-row">
-              <button class="copy-btn" @click="copyPrompt">{{ copiedPrompt ? 'Prompt Copied!' : 'Copy Prompt' }}</button>
-              <button class="copy-btn" @click="copyUrl">{{ copiedUrl ? 'URL Copied!' : 'Share URL' }}</button>
+        <div class="pages" :class="layout">
+          <article v-for="(p, i) in pages" :key="i" class="prompt-card export-page" :style="{ background: gradients[(gradientIndex + i) % gradients.length] }">
+            <div class="card-inner" :class="layout">
+              <header class="card-head">
+                <h2 class="card-title">Prompt ({{ i + 1 }}/{{ pages.length }})</h2>
+                <span class="layout-badge">{{ layoutLabel }}</span>
+              </header>
+              <p class="prompt-text" v-text="p" />
+              <div class="share-row">
+                <button class="copy-btn" @click="copyPrompt">{{ copiedPrompt ? 'Copied!' : 'Copy Text' }}</button>
+                <button class="copy-btn" @click="copyUrl">{{ copiedUrl ? 'URL Copied!' : 'Share URL' }}</button>
+              </div>
             </div>
-          </div>
-        </article>
+          </article>
+        </div>
       </section>
     </transition>
     <section class="how-it-works">
@@ -335,6 +408,12 @@ button:active:not(:disabled) {
     0 4px 12px -2px rgba(0, 0, 0, 0.4);
   animation: appear 0.7s cubic-bezier(0.16, 0.8, 0.27, 1);
 }
+.pages.square .prompt-card { aspect-ratio: 1 / 1; display:flex; }
+.pages.vertical .prompt-card { aspect-ratio: 9 / 16; display:flex; max-width:420px; }
+.card-inner.vertical { padding: 2rem 1.4rem 2.2rem; }
+.layout-select { border:1px solid var(--c-border); background:#1e2530; color:var(--c-text); border-radius:10px; padding:0.6rem 0.9rem; font-size:0.8rem; }
+.layout-badge { font-size:0.6rem; letter-spacing:0.1em; background:rgba(255,255,255,.25); padding:0.35rem 0.6rem; border-radius:999px; text-transform:uppercase; }
+.card-head { display:flex; align-items:center; justify-content:space-between; gap:0.75rem; }
 .prompt-card::before {
   content: "";
   position: absolute;
